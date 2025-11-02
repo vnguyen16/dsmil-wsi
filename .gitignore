@@ -21,3 +21,9 @@ abmil.py
 *.csv
 *.pth
 *.log
+weights/
+test/
+results/
+datasets/
+temp_train/
+temp_test/

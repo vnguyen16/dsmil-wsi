@@ -183,6 +183,7 @@ def get_current_score(avg_score, aucs):
 def save_model(args, fold, run, save_path, model, thresholds_optimal):
     # Construct the filename including the fold number
     save_name = os.path.join(save_path, f'fold_{fold}_{run+1}.pth')
+    os.makedirs(os.path.dirname(save_name), exist_ok=True) # added to ensure directory exists
     torch.save(model.state_dict(), save_name)
     print_save_message(args, save_name, thresholds_optimal)
     file_name = os.path.join(save_path, f'fold_{fold}_{run+1}.json')
@@ -213,6 +214,11 @@ def main():
     parser.add_argument('--non_linearity', default=1, type=float, help='Additional nonlinear operation [0]')
     parser.add_argument('--average', type=bool, default=False, help='Average the score of max-pooling and bag aggregating')
     parser.add_argument('--eval_scheme', default='5-fold-cv', type=str, help='Evaluation scheme [5-fold-cv | 5-fold-cv-standalone-test | 5-time-train+valid+test ]')
+
+    # add arguments for patient splitting
+    # parser.add_argument('--cv_root', type=str, default=None,
+    #                 help='Root directory containing cross-validation folds (each with train/val/test CSVs)')
+
 
     
     args = parser.parse_args()
@@ -247,7 +253,15 @@ def main():
     else:
         bags_csv = os.path.join('datasets', args.dataset, args.dataset+'.csv')
 
-    generate_pt_files(args, pd.read_csv(bags_csv))
+    # ---------------------------- 
+    # skip generation of .pt files if already done
+    if not os.path.exists("temp_train") or len(os.listdir("temp_train")) == 0:
+        print("No existing intermediate .pt files found — generating them now.")
+        generate_pt_files(args, pd.read_csv(bags_csv))
+    else:
+        print("Intermediate .pt files already exist. Skipping generation.")
+    # ----------------------------
+    # generate_pt_files(args, pd.read_csv(bags_csv)) # og
  
     if args.eval_scheme == '5-fold-cv':
         bags_path = glob.glob('temp_train/*.pt')
@@ -346,6 +360,87 @@ def main():
         print(f"Final results: Mean Accuracy: {mean_ac}")
         for i, mean_score in enumerate(mean_auc):
             print(f"Class {i}: Mean AUC = {mean_score:.4f}")
+    
+    elif args.eval_scheme == '5-fold-cv-from-csv': # added for patient-wise splitting from predefined csv files
+        print(f"Running DSMIL using predefined CSV folds for {args.dataset}")
+
+        # Path to your cross-validation root (each subdir = one fold)
+        cv_root = os.path.join("C:/Users/Vivian/Documents/PANTHER/PANTHER/src/splits/cross-val")
+        fold_dirs = sorted([os.path.join(cv_root, d)
+                            for d in os.listdir(cv_root)
+                            if os.path.isdir(os.path.join(cv_root, d))])
+
+        all_results = []
+
+        def read_slide_list(csv_path):
+            df = pd.read_csv(csv_path)
+            if "slide" in df.columns:
+                slides = df["slide"].tolist()
+            elif "slide_id" in df.columns:
+                slides = df["slide_id"].tolist()
+            else:
+                slides = df.iloc[:, 0].tolist()
+            # strip extension if present
+            return [os.path.splitext(s)[0] for s in slides]
+
+        for fold_idx, fold_dir in enumerate(fold_dirs):
+            print(f"\n=== Fold {fold_idx}: {fold_dir} ===")
+
+            train_csv = os.path.join(fold_dir, "train.csv")
+            val_csv   = os.path.join(fold_dir, "val.csv")
+            test_csv  = os.path.join(fold_dir, "test.csv")
+
+            train_slides = read_slide_list(train_csv)
+            val_slides   = read_slide_list(val_csv)
+            test_slides  = read_slide_list(test_csv)
+
+            all_bags = glob.glob("temp_train/*.pt")
+            slide_to_path = {os.path.splitext(os.path.basename(f))[0]: f for f in all_bags}
+
+            train_path = [slide_to_path[s] for s in train_slides if s in slide_to_path]
+            val_path   = [slide_to_path[s] for s in val_slides if s in slide_to_path]
+            test_path  = [slide_to_path[s] for s in test_slides if s in slide_to_path]
+
+            print(f"Slides loaded — train:{len(train_path)}, val:{len(val_path)}, test:{len(test_path)}")
+
+            # --- init model ---
+            milnet, criterion, optimizer, scheduler = init_model(args)
+            fold_best_score = 0
+            best_ac, best_auc = 0, 0
+            counter = 0
+
+            # --- training loop ---
+            for epoch in range(1, args.num_epochs + 1):
+                counter += 1
+                train_loss_bag = train(args, train_path, milnet, criterion, optimizer)
+                val_loss_bag, avg_score, aucs, thresholds_optimal = test(args, val_path, milnet, criterion)
+
+                print_epoch_info(epoch, args, train_loss_bag, val_loss_bag, avg_score, aucs)
+                scheduler.step()
+
+                current_score = get_current_score(avg_score, aucs)
+                if current_score > fold_best_score:
+                    counter = 0
+                    fold_best_score = current_score
+                    best_ac, best_auc = avg_score, aucs
+                    save_model(args, fold_idx, 0,
+                            os.path.join("weights", datetime.date.today().strftime("%Y%m%d")),
+                            milnet, thresholds_optimal)
+                    best_model = milnet
+                if counter > args.stop_epochs:
+                    break
+
+            # --- test best model ---
+            test_loss_bag, test_acc, test_auc, _ = test(args, test_path, best_model, criterion)
+            print(f"[Fold {fold_idx}] Test Accuracy: {test_acc:.3f}, AUC: {test_auc}")
+            all_results.append([fold_idx, test_acc, test_auc])
+
+        df_summary = pd.DataFrame(all_results, columns=["fold", "test_acc", "test_auc"])
+        os.makedirs("results", exist_ok=True)
+        df_summary.to_csv("results/dsmil_cv_from_csv_summary.csv", index=False)
+        print("\nCross-validation complete:")
+        print(df_summary)
+
 
     if args.eval_scheme == '5-fold-cv-standalone-test':
         bags_path = glob.glob('temp_train/*.pt')

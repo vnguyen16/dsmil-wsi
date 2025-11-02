@@ -112,6 +112,34 @@ def quad_high_coords(low_coord: Tuple[int, int], ratio: float, patch_size: int, 
         (x_base + patch_size, y_base + patch_size),
     ]
 
+# adding for 10x patches
+def grid_high_coords(
+    low_coord: Tuple[int, int],
+    ratio: float,
+    patch_size: int,
+    offset: Tuple[int, int],
+    stride_high: Optional[int] = None,
+) -> List[Tuple[int, int]]:
+    """
+    Generate an r×r grid (r≈round(ratio)) of high-mag patch origins that tile the
+    low-mag receptive field. Works for ratio=2.0 (2×2) or ratio=4.0 (4×4), etc.
+    Assumes same patch size at low/high scales; use stride_high if your high-mag
+    extractor uses a different stride than patch_size.
+    """
+    x_low, y_low = low_coord
+    r = int(round(ratio))
+    if r <= 0:
+        r = 1
+    x_base = int(round(x_low * ratio)) + offset[0]
+    y_base = int(round(y_low * ratio)) + offset[1]
+    step = stride_high if (stride_high is not None and stride_high > 0) else patch_size
+
+    coords: List[Tuple[int, int]] = []
+    for v in range(r):
+        for u in range(r):
+            coords.append((x_base + u * step, y_base + v * step))
+    return coords
+
 
 def fuse_patch(
     feat_low: np.ndarray,
@@ -168,10 +196,12 @@ class ConverterConfig:
     label_column: str
     ratio: float
     patch_size: int
+    stride_high: int # added 
     tolerance: int
     offset_x_high: int
     offset_y_high: int
     fusion: str
+    anchor: str
     relative_paths: bool
     write_coords: bool
     index_only: bool
@@ -191,6 +221,19 @@ def load_labels(csv_paths: Sequence[Path], slide_col: str, label_col: str) -> Ma
         raise ValueError(f"Found conflicting labels for slides: {duplicates}")
     return dict(zip(merged[slide_col].astype(str), merged[label_col].astype(str)))
 
+def inverse_map_to_low(high_coord: Tuple[int, int], ratio: float, offset: Tuple[int, int]) -> Tuple[int, int]:
+    """
+    Invert the forward mapping:
+      forward:  (x_low, y_low) -> round(x_low*ratio)+off, round(y_low*ratio)+off (+ grid steps)
+      inverse:  (x_high, y_high) -> round((x_high - off)/ratio)
+    Returns the *predicted* low top-left; we still pass it through find_index with tolerance.
+    """
+    xh, yh = high_coord
+    offx, offy = offset
+    x_low_pred = int(round((xh - offx) / ratio))
+    y_low_pred = int(round((yh - offy) / ratio))
+    return x_low_pred, y_low_pred
+
 
 def convert_slide(
     slide_id: str,
@@ -207,6 +250,10 @@ def convert_slide(
     feats_high: Optional[np.ndarray] = None
     coords_high: Optional[np.ndarray] = None
     high_index: Optional[Dict[Tuple[int, int], int]] = None
+    # added for anchor high
+    # feats_low, coords_low = load_h5_features(low_files[slide_id])
+    low_index: Optional[Dict[Tuple[int, int], int]] = build_coord_index(coords_low)
+
 
     if config.high_mag_dir is not None:
         if slide_id not in high_files:
@@ -215,20 +262,117 @@ def convert_slide(
         high_index = build_coord_index(coords_high)
         high_dim = feats_high.shape[1]
 
+    # ------ og 
+    # fused_patches: List[np.ndarray] = []
+    # quad_offset = (config.offset_x_high, config.offset_y_high)
+    # for idx_low, (x_low, y_low) in enumerate(coords_low.astype(int)):
+    #     low_vec = feats_low[idx_low]
+    #     high_vectors: List[np.ndarray] = []
+    #     if feats_high is not None and high_index is not None:
+    #         # for 5x patches
+    #         # for coord_high in quad_high_coords((x_low, y_low), config.ratio, config.patch_size, quad_offset):
+    #         #     index = find_index(high_index, coord_high, config.tolerance)
+    #         #     if index is not None:
+    #         #         high_vectors.append(feats_high[index])
+    #         for coord_high in grid_high_coords(
+    #             (x_low, y_low),
+    #             config.ratio,
+    #             config.patch_size,
+    #             quad_offset,
+    #             stride_high=config.stride_high,
+    #         ):
+    #             index = find_index(high_index, coord_high, config.tolerance)
+    #             if index is not None:
+    #                 high_vectors.append(feats_high[index])
+
+    #     fused = fuse_patch(low_vec, high_vectors, config.fusion, high_dim)
+    #     fused_patches.append(fused)
+        # return write_slide_csv(slide_id, label, np.stack(fused_patches, axis=0), coords_low, config)
+
+    # og --------
+    
+    # anchor high
     fused_patches: List[np.ndarray] = []
     quad_offset = (config.offset_x_high, config.offset_y_high)
-    for idx_low, (x_low, y_low) in enumerate(coords_low.astype(int)):
-        low_vec = feats_low[idx_low]
-        high_vectors: List[np.ndarray] = []
-        if feats_high is not None and high_index is not None:
-            for coord_high in quad_high_coords((x_low, y_low), config.ratio, config.patch_size, quad_offset):
-                index = find_index(high_index, coord_high, config.tolerance)
-                if index is not None:
-                    high_vectors.append(feats_high[index])
-        fused = fuse_patch(low_vec, high_vectors, config.fusion, high_dim)
-        fused_patches.append(fused)
 
-    return write_slide_csv(slide_id, label, np.stack(fused_patches, axis=0), coords_low, config)
+    if config.anchor == "low":
+        # === Original behavior: one row per LOW patch (pool HIGH) ===
+        for idx_low, (x_low, y_low) in enumerate(coords_low.astype(int)):
+            low_vec = feats_low[idx_low]
+            high_vectors: List[np.ndarray] = []
+            if feats_high is not None and high_index is not None:
+                # keep your existing quad/grid generator here:
+                for coord_high in grid_high_coords(
+                    (x_low, y_low),
+                    config.ratio,
+                    config.patch_size,
+                    quad_offset,
+                    stride_high=config.stride_high,
+                ):
+                    index = find_index(high_index, coord_high, config.tolerance)
+                    if index is not None:
+                        high_vectors.append(feats_high[index])
+
+            fused = fuse_patch(low_vec, high_vectors, config.fusion, high_dim)
+            fused_patches.append(fused)
+
+        LOGGER.info(
+        "Slide %s | anchor=%s | low=%s high=%s | fused_rows=%d",
+        slide_id, config.anchor,
+        feats_low.shape[0],
+        0 if feats_high is None else feats_high.shape[0],
+        len(fused_patches),
+    )
+
+        return write_slide_csv(slide_id, label, np.stack(fused_patches, axis=0), coords_low, config)
+
+    else:
+        # === NEW behavior: one row per HIGH patch (pair with parent LOW) ===
+        if feats_high is None or coords_high is None or high_index is None:
+            raise FileNotFoundError(f"High-magnification H5 required when anchor='high' for slide '{slide_id}'")
+
+        for idx_high, (x_high, y_high) in enumerate(coords_high.astype(int)):
+            # predict the parent low coord (invert the ratio+offset mapping)
+            x_low_pred, y_low_pred = inverse_map_to_low((x_high, y_high), config.ratio, quad_offset)
+
+            # find the nearest low patch on the low grid within tolerance
+            idx_low = find_index(low_index, (x_low_pred, y_low_pred), config.tolerance)
+            if idx_low is None:
+                # OPTIONS:
+                #   - skip this high patch (recommended)
+                #   - or use zeros for the missing low_vec if fusion needs it
+                # Here we skip:
+                continue
+
+            low_vec = feats_low[idx_low]
+            high_vec = feats_high[idx_high]
+
+            # Apply fusion for a *pair* (no pooling now)
+            if config.fusion == "cat":
+                fused = np.concatenate([low_vec, high_vec], axis=0)
+            elif config.fusion == "low":
+                fused = low_vec
+            elif config.fusion == "high":
+                fused = high_vec
+            elif config.fusion == "add":
+                if low_vec.shape != high_vec.shape:
+                    raise ValueError(
+                        f"Cannot add features of different dims: low={low_vec.shape}, high={high_vec.shape}"
+                    )
+                fused = low_vec + high_vec
+            else:
+                raise ValueError(f"Unsupported fusion strategy for anchor='high': {config.fusion}")
+
+            fused_patches.append(fused)
+
+        if not fused_patches:
+            raise RuntimeError(f"No high->low matches found for slide '{slide_id}'. Check ratio/offset/tolerance.")
+
+        # Write rows aligned to HIGH coords (since anchor=high)
+        return write_slide_csv(slide_id, label, np.stack(fused_patches, axis=0), coords_high, config)
+    # ------ added for anchor high
+
+
 
 
 def write_slide_csv(
@@ -335,6 +479,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> ConverterConfig:
     parser.add_argument("--ratio", type=float, default=2.0, help="Coordinate scale ratio between low and high magnification")
     parser.add_argument("--patch-size", type=int, default=224, help="Patch size used during extraction (in pixels)")
     parser.add_argument(
+    "--stride-high",
+    type=int,
+    default=224,
+    help="Stride used for high-magnification tiling (pixels at high scale; defaults to patch size).",
+)
+
+    parser.add_argument(
         "--tolerance",
         type=int,
         default=0,
@@ -364,6 +515,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> ConverterConfig:
         help="Skip feature conversion and only (re)write the dataset index CSV using existing slide CSVs",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+    "--anchor",
+    choices=["low", "high"],
+    default="low",
+    help="Which scale defines the instances in the bag. 'low' = one row per low-mag patch (pool high). 'high' = one row per high-mag patch (pair each to its parent low patch).",
+)
+
 
     args = parser.parse_args(argv)
 
@@ -377,10 +535,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> ConverterConfig:
         label_column=args.label_column,
         ratio=args.ratio,
         patch_size=args.patch_size,
+        stride_high=args.stride_high,
         tolerance=args.tolerance,
         offset_x_high=args.offset_x_high,
         offset_y_high=args.offset_y_high,
         fusion=args.fusion,
+        anchor=args.anchor,
         relative_paths=args.relative_paths,
         write_coords=args.write_coords,
         index_only=args.index_only,
